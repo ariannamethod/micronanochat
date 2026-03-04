@@ -150,7 +150,7 @@ static Config config_from_depth(int depth) {
     c.personality_steps = 100;
 
     snprintf(c.data_url, sizeof(c.data_url),
-        "https://www.gutenberg.org/cache/epub/100/pg100.txt"); /* shakespeare. 5.5MB. no parsing needed. */
+        "https://datasets-server.huggingface.co/rows?dataset=HuggingFaceFW/fineweb-edu&config=sample-10BT&split=train&offset=0&length=5000"); /* FineWeb-Edu via HF API */
     snprintf(c.data_path, sizeof(c.data_path), "l_data.txt");
     snprintf(c.personality_path, sizeof(c.personality_path), "personality.txt");
     snprintf(c.gguf_path, sizeof(c.gguf_path), "l.gguf");
@@ -1504,12 +1504,203 @@ static void adam_step(Adam *opt, ParamList *params, float **grads, float lr, flo
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * DATA LOADING — give it a text file. any text file. it doesn't judge.
- * no parquet parser. no huggingface datasets library. no 2GB arrow cache.
- * fopen, fread, done. your data pipeline is 30 lines. you're welcome.
+ * DATA LOADING — THREE sources, zero dependencies:
+ *   1. --url: HuggingFace rows API → JSON → extracts "text" fields
+ *   2. --parquet FILE: inline Snappy + Thrift + Parquet reader
+ *   3. fallback: synthetic. shameful but functional.
+ * yes, we have a parquet parser. in C. inline. deal with it.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-/* Download training text — tries curl first, falls back to synthetic */
+/* ── HuggingFace JSON text extractor ── */
+static int hf_extract_texts(const char *json, int json_len, FILE *out) {
+    int count = 0;
+    const char *p = json, *end = json + json_len;
+    while (p < end) {
+        p = strstr(p, "\"text\":\"");
+        if (!p) break;
+        p += 8;
+        const char *start = p;
+        while (p < end && !(*p == '"' && *(p-1) != '\\')) p++;
+        if (p >= end) break;
+        for (const char *s = start; s < p; s++) {
+            if (*s == '\\' && s + 1 < p) {
+                s++;
+                if (*s == 'n') fputc('\n', out);
+                else if (*s == 't') fputc('\t', out);
+                else if (*s == '\\') fputc('\\', out);
+                else if (*s == '"') fputc('"', out);
+                else if (*s == 'u' && s + 4 < p) { fputc('?', out); s += 4; }
+                else fputc(*s, out);
+            } else fputc(*s, out);
+        }
+        fputc('\n', out);
+        count++;
+        p++;
+    }
+    return count;
+}
+
+/* ── Snappy decompressor (for parquet) ── */
+static int snappy_decompress(const uint8_t *src, int slen, uint8_t *dst, int dlen) {
+    int si = 0, di = 0;
+    uint32_t ulen = 0; int shift = 0;
+    while (si < slen) { uint8_t b = src[si++]; ulen |= (uint32_t)(b & 0x7F) << shift; if (!(b & 0x80)) break; shift += 7; }
+    if ((int)ulen > dlen) return -1;
+    while (si < slen && di < (int)ulen) {
+        uint8_t tag = src[si++]; int type = tag & 3;
+        if (type == 0) {
+            int len = (tag >> 2) + 1;
+            if ((tag >> 2) >= 60) { int nb = (tag >> 2) - 59; len = 0; for (int i = 0; i < nb && si < slen; i++) len |= src[si++] << (i * 8); len++; }
+            if (si + len > slen || di + len > (int)ulen) return -1;
+            memcpy(dst + di, src + si, len); si += len; di += len;
+        } else {
+            int len, off;
+            if (type == 1) { len = ((tag >> 2) & 7) + 4; if (si >= slen) return -1; off = ((tag >> 5) << 8) | src[si++]; }
+            else if (type == 2) { len = (tag >> 2) + 1; if (si + 1 >= slen) return -1; off = src[si] | (src[si+1] << 8); si += 2; }
+            else { len = (tag >> 2) + 1; if (si + 3 >= slen) return -1; off = src[si] | (src[si+1]<<8) | (src[si+2]<<16) | (src[si+3]<<24); si += 4; }
+            if (off == 0 || di - off < 0) return -1;
+            for (int i = 0; i < len; i++) dst[di + i] = dst[di - off + i];
+            di += len;
+        }
+    }
+    return di;
+}
+
+/* ── Thrift Compact Protocol decoder (for parquet footer) ── */
+typedef struct { const uint8_t *data; int pos, len; } TR;
+static uint64_t tr_varint(TR *r) { uint64_t v=0; int s=0; while(r->pos<r->len){uint8_t b=r->data[r->pos++];v|=(uint64_t)(b&0x7F)<<s;if(!(b&0x80))break;s+=7;} return v; }
+static int64_t tr_zigzag(TR *r) { uint64_t v=tr_varint(r); return (int64_t)((v>>1)^-(v&1)); }
+static char *tr_string(TR *r) { uint64_t l=tr_varint(r); char *s=malloc(l+1); if(r->pos+(int)l<=r->len){memcpy(s,r->data+r->pos,l);r->pos+=(int)l;}s[l]=0; return s; }
+static void tr_skip(TR *r, int type);
+static void tr_skip_struct(TR *r) { int prev=0; while(r->pos<r->len){uint8_t b=r->data[r->pos++];if(b==0)break;int ft=b&0xF,delta=(b>>4)&0xF;if(delta==0){prev=(int)(int16_t)tr_zigzag(r);}else prev+=delta;tr_skip(r,ft);} }
+static void tr_skip(TR *r, int type) {
+    switch(type) {
+        case 1: case 2: break;
+        case 3: case 4: case 5: case 6: tr_zigzag(r); break;
+        case 7: r->pos+=8; break;
+        case 8: { uint64_t l=tr_varint(r); r->pos+=(int)l; break; }
+        case 9: case 10: { uint8_t h=r->data[r->pos++]; int cnt=(h>>4)&0xF, et=h&0xF; if(cnt==0xF)cnt=(int)tr_varint(r); for(int i=0;i<cnt;i++)tr_skip(r,et); break; }
+        case 11: { uint8_t h=r->data[r->pos++]; int kt=(h>>4)&0xF, vt=h&0xF; int cnt=(int)tr_varint(r); for(int i=0;i<cnt;i++){tr_skip(r,kt);tr_skip(r,vt);} break; }
+        case 12: tr_skip_struct(r); break;
+    }
+}
+
+/* ── Parquet reader ── */
+typedef struct { char *name; int64_t data_off, dict_off, comp_size, nval; int codec; } PqCol;
+typedef struct { PqCol *cols; int n; int64_t nrows; } PqMeta;
+
+static PqMeta pq_footer(const uint8_t *f, int64_t sz) {
+    PqMeta m = {0};
+    uint32_t flen = *(uint32_t*)(f + sz - 8);
+    TR r = { f + sz - 8 - flen, 0, (int)flen };
+    int prev = 0;
+    while (r.pos < r.len) {
+        uint8_t b = r.data[r.pos++]; if (b == 0) break;
+        int ft = b & 0xF, delta = (b >> 4) & 0xF;
+        int fid = delta ? prev + delta : (int)(int16_t)tr_zigzag(&r); prev = fid;
+        if (fid == 1 && ft == 5) tr_zigzag(&r);
+        else if (fid == 2 && ft == 9) { uint8_t h=r.data[r.pos++]; int cnt=(h>>4)&0xF; if(cnt==0xF)cnt=(int)tr_varint(&r); for(int i=0;i<cnt;i++)tr_skip_struct(&r); }
+        else if (fid == 3 && ft == 6) m.nrows = (int64_t)tr_zigzag(&r);
+        else if (fid == 4 && ft == 9) {
+            uint8_t h=r.data[r.pos++]; int rg_cnt=(h>>4)&0xF; if(rg_cnt==0xF)rg_cnt=(int)tr_varint(&r);
+            for (int rg=0; rg<rg_cnt; rg++) {
+                int rp=0;
+                while (r.pos<r.len) { uint8_t rb=r.data[r.pos++]; if(rb==0)break; int rt=rb&0xF,rd=(rb>>4)&0xF; int rf=rd?rp+rd:(int)(int16_t)tr_zigzag(&r); rp=rf;
+                    if (rf==1 && rt==9) {
+                        uint8_t ch=r.data[r.pos++]; int cc=(ch>>4)&0xF; if(cc==0xF)cc=(int)tr_varint(&r);
+                        for (int ci=0; ci<cc; ci++) {
+                            PqCol col={0}; col.dict_off=-1; int cp=0;
+                            while (r.pos<r.len) { uint8_t cb=r.data[r.pos++]; if(cb==0)break; int ct_=cb&0xF,cd_=(cb>>4)&0xF; int cf=cd_?cp+cd_:(int)(int16_t)tr_zigzag(&r); cp=cf;
+                                if (cf==3 && ct_==12) {
+                                    int mp=0;
+                                    while (r.pos<r.len) { uint8_t mb=r.data[r.pos++]; if(mb==0)break; int mt=mb&0xF,md=(mb>>4)&0xF; int mf=md?mp+md:(int)(int16_t)tr_zigzag(&r); mp=mf;
+                                        if (mf==3&&mt==9) { uint8_t lh=r.data[r.pos++]; int lc=(lh>>4)&0xF; if(lc==0xF)lc=(int)tr_varint(&r); for(int li=0;li<lc;li++){char*s=tr_string(&r);if(li==lc-1)col.name=s;else free(s);} }
+                                        else if (mf==4&&mt==5) col.codec=(int)tr_zigzag(&r);
+                                        else if (mf==5&&mt==6) col.nval=(int64_t)tr_zigzag(&r);
+                                        else if (mf==7&&mt==6) col.comp_size=(int64_t)tr_zigzag(&r);
+                                        else if (mf==9&&mt==6) col.data_off=(int64_t)tr_zigzag(&r);
+                                        else if (mf==11&&mt==6) col.dict_off=(int64_t)tr_zigzag(&r);
+                                        else tr_skip(&r,mt);
+                                    }
+                                } else tr_skip(&r,ct_);
+                            }
+                            m.n++; m.cols=realloc(m.cols,m.n*sizeof(PqCol)); m.cols[m.n-1]=col;
+                        }
+                    } else tr_skip(&r,rt);
+                }
+            }
+        } else tr_skip(&r,ft);
+    }
+    return m;
+}
+
+typedef struct { int type, comp_sz, uncomp_sz, nval; } PgHdr;
+static PgHdr pq_page_hdr(const uint8_t *data, int len, int *hlen) {
+    TR r={data,0,len}; PgHdr h={0}; int prev=0;
+    while (r.pos<r.len) { uint8_t b=r.data[r.pos++]; if(b==0)break; int ft=b&0xF,delta=(b>>4)&0xF; int fid=delta?prev+delta:(int)(int16_t)tr_zigzag(&r); prev=fid;
+        if (fid==1&&ft==5) h.type=(int)tr_zigzag(&r);
+        else if (fid==2&&ft==5) h.uncomp_sz=(int)tr_zigzag(&r);
+        else if (fid==3&&ft==5) h.comp_sz=(int)tr_zigzag(&r);
+        else if ((fid==5||fid==7||fid==8)&&ft==12) { int dp=0; while(r.pos<r.len){uint8_t db=r.data[r.pos++];if(db==0)break;int dt=db&0xF,dd=(db>>4)&0xF;int df=dd?dp+dd:(int)(int16_t)tr_zigzag(&r);dp=df;if(df==1&&dt==5)h.nval=(int)tr_zigzag(&r);else tr_skip(&r,dt);} }
+        else tr_skip(&r,ft);
+    }
+    *hlen=r.pos; return h;
+}
+
+static int pq_extract(const uint8_t *file, int64_t fsz, PqCol *col, FILE *out) {
+    int64_t pos=(col->dict_off>=0)?col->dict_off:col->data_off;
+    int64_t end=col->data_off+col->comp_size;
+    int total=0; char **dict=NULL; int *dlens=NULL, dsz=0;
+    while (pos<end && pos<fsz) {
+        int hlen; PgHdr ph=pq_page_hdr(file+pos,(int)(fsz-pos),&hlen);
+        pos+=hlen; if(ph.comp_sz<=0||pos+ph.comp_sz>fsz)break;
+        uint8_t *pd; int plen; int nf=0;
+        if (col->codec==1) { pd=malloc(ph.uncomp_sz); plen=snappy_decompress(file+pos,ph.comp_sz,pd,ph.uncomp_sz); if(plen<0){free(pd);pos+=ph.comp_sz;continue;} nf=1; }
+        else { pd=(uint8_t*)(file+pos); plen=ph.comp_sz; }
+        if (ph.type==2) {
+            dsz=ph.nval; dict=calloc(dsz,sizeof(char*)); dlens=calloc(dsz,sizeof(int));
+            int dp=0;
+            for(int i=0;i<dsz&&dp+4<=plen;i++){int32_t sl=*(int32_t*)(pd+dp);dp+=4;if(dp+sl>plen)break;dict[i]=malloc(sl);memcpy(dict[i],pd+dp,sl);dlens[i]=sl;dp+=sl;}
+        } else if (ph.type==0||ph.type==3) {
+            int dp=0;
+            if (dsz>0) {
+                if(dp>=plen)goto nxt;
+                int bw=pd[dp++];
+                for(int v=0;v<ph.nval&&dp<plen;){
+                    uint8_t rh=pd[dp++];
+                    if(rh&1){ int count=(rh>>1)*8,bytes=(count*bw+7)/8; uint64_t buf=0;int bb=0,bp=dp;
+                        for(int i=0;i<count&&v<ph.nval;i++,v++){while(bb<bw&&bp<dp+bytes&&bp<plen){buf|=(uint64_t)pd[bp++]<<bb;bb+=8;}int idx=(int)(buf&((1ULL<<bw)-1));buf>>=bw;bb-=bw;if(idx>=0&&idx<dsz){fwrite(dict[idx],1,dlens[idx],out);fputc('\n',out);total++;}}
+                        dp+=bytes;
+                    } else { int count=rh>>1,idx=0,nb=(bw+7)/8; for(int b=0;b<nb&&dp<plen;b++)idx|=pd[dp++]<<(b*8);
+                        for(int i=0;i<count&&v<ph.nval;i++,v++){if(idx>=0&&idx<dsz){fwrite(dict[idx],1,dlens[idx],out);fputc('\n',out);total++;}}}
+                }
+            } else {
+                for(int v=0;v<ph.nval&&dp+4<=plen;v++){int32_t sl=*(int32_t*)(pd+dp);dp+=4;if(sl<0||dp+sl>plen)break;fwrite(pd+dp,1,sl,out);fputc('\n',out);dp+=sl;total++;}
+            }
+        }
+        nxt: if(nf)free(pd); pos+=ph.comp_sz;
+    }
+    if(dict){for(int i=0;i<dsz;i++)free(dict[i]);free(dict);free(dlens);}
+    return total;
+}
+
+static int load_parquet(const char *path, const char *out_path, const char *col_name) {
+    FILE *f=fopen(path,"rb"); if(!f)return -1;
+    fseek(f,0,SEEK_END); int64_t fsz=ftell(f); fseek(f,0,SEEK_SET);
+    uint8_t *file=malloc(fsz); fread(file,1,fsz,f); fclose(f);
+    if(fsz<12||memcmp(file,"PAR1",4)!=0||memcmp(file+fsz-4,"PAR1",4)!=0){free(file);return -1;}
+    PqMeta meta=pq_footer(file,fsz);
+    printf("[parquet] %lld rows, %d column chunks\n",(long long)meta.nrows,meta.n);
+    FILE *out=fopen(out_path,"w"); if(!out){free(file);return -1;}
+    int total=0;
+    for(int i=0;i<meta.n;i++){if(meta.cols[i].name&&strcmp(meta.cols[i].name,col_name)==0)total+=pq_extract(file,fsz,&meta.cols[i],out);}
+    fclose(out);
+    for(int i=0;i<meta.n;i++)free(meta.cols[i].name); free(meta.cols); free(file);
+    printf("[parquet] extracted %d texts from '%s'\n",total,col_name);
+    return total>0?0:-1;
+}
+
+/* Download training text — HF API → JSON → text, or synthetic fallback */
 static int download_data(Config *c) {
     struct stat st;
     if (stat(c->data_path, &st) == 0 && st.st_size > 1000) {
@@ -1517,26 +1708,30 @@ static int download_data(Config *c) {
                (float)st.st_size / 1048576.0f);
         return 0;
     }
-
-    /* try downloading. curl exists on every OS made after 2003. */
     if (c->data_url[0]) {
-        printf("[data] downloading from %s...\n", c->data_url);
+        printf("[data] fetching from HuggingFace API...\n");
+        char tmp[280]; snprintf(tmp,sizeof(tmp),"%s.json",c->data_path);
         char cmd[1024];
-        snprintf(cmd, sizeof(cmd), "curl -sL '%s' -o '%s'", c->data_url, c->data_path);
-        int r = system(cmd);
-        if (r == 0 && stat(c->data_path, &st) == 0 && st.st_size > 1000) {
-            printf("[data] downloaded %s (%.1f MB)\n", c->data_path,
-                   (float)st.st_size / 1048576.0f);
-            return 0;
+        snprintf(cmd,sizeof(cmd),"curl -sL '%s' -o '%s'",c->data_url,tmp);
+        int r=system(cmd);
+        if(r==0&&stat(tmp,&st)==0&&st.st_size>1000){
+            FILE *jf=fopen(tmp,"r"); if(jf){
+                char *json=malloc(st.st_size+1);
+                int jl=(int)fread(json,1,st.st_size,jf); json[jl]=0; fclose(jf);
+                FILE *out=fopen(c->data_path,"w");
+                if(out){ int n=hf_extract_texts(json,jl,out); fclose(out);
+                    printf("[data] extracted %d texts from HuggingFace\n",n);
+                    free(json); unlink(tmp);
+                    if(n>0)return 0;
+                } else free(json);
+            }
         }
-        printf("[data] download failed (no curl? no internet? no luck?)\n");
+        unlink(tmp);
+        printf("[data] HuggingFace download failed\n");
     }
-
-    /* fallback: synthetic. shameful but functional. */
     printf("[data] creating synthetic dataset for demo...\n");
     FILE *f = fopen(c->data_path, "w");
     if (!f) return -1;
-
     const char *samples[] = {
         "The quick brown fox jumps over the lazy dog. This is a simple sentence for training.",
         "Machine learning is a subset of artificial intelligence that focuses on learning from data.",
@@ -1550,7 +1745,6 @@ static int download_data(Config *c) {
         "Tokenization converts text into numerical tokens that the model can process.",
         NULL
     };
-
     for (int repeat = 0; repeat < 500; repeat++)
         for (int i = 0; samples[i]; i++)
             fprintf(f, "%s\n", samples[i]);
@@ -1838,9 +2032,12 @@ int main(int argc, char **argv) {
             printf("Usage: ./l [options]\n");
             printf("  --depth N       Model depth (2=~1M, 4=~3M, 6=~7M, 8=~15M params)\n");
             printf("  --data PATH     Path to training text file\n");
+            printf("  --url URL       HuggingFace rows API URL for training data\n");
+            printf("  --parquet FILE  Extract text from local .parquet file\n");
             printf("  --fp16-cache    Half-precision KV cache (saves memory)\n");
             printf("  --rope-scale F  NTK scaling for RoPE (>1 extends context)\n");
             printf("  --help          Show this help\n");
+            printf("\n  BLAS:  cc l.c -O3 -lm -DUSE_BLAS -DACCELERATE -framework Accelerate -o l\n");
             return 0;
         }
     }
@@ -1857,6 +2054,15 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--data") == 0 && i + 1 < argc)
             snprintf(c.data_path, sizeof(c.data_path), "%s", argv[i+1]);
+        else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc)
+            snprintf(c.data_url, sizeof(c.data_url), "%s", argv[++i]);
+        else if (strcmp(argv[i], "--parquet") == 0 && i + 1 < argc) {
+            const char *pqf = argv[++i];
+            printf("[parquet] loading %s...\n", pqf);
+            if (load_parquet(pqf, c.data_path, "text") != 0) {
+                fprintf(stderr, "[error] parquet load failed\n"); return 1;
+            }
+        }
         else if (strcmp(argv[i], "--fp16-cache") == 0)
             c.fp16_cache = 1;
         else if (strcmp(argv[i], "--rope-scale") == 0 && i + 1 < argc)
