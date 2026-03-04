@@ -1,24 +1,26 @@
 /*
- * microchat.c — A single-file, dependency-free LLM that downloads data,
- * trains a BPE tokenizer, builds a Llama-architecture transformer from scratch,
- * trains it with autograd + Adam, optionally finetunes on personality,
+ * l.c — one file. one llama. no excuses.
+ *
+ * A single-file, dependency-free LLM that downloads data,
+ * trains a BPE tokenizer, builds a Llama 3 transformer from scratch,
+ * trains it with analytical backprop + Adam, finetunes on personality,
  * exports to GGUF, and runs interactive chat.
  *
- * One file. Pure C. No PyTorch. No Python. No frameworks.
- * Just cc microchat.c -O3 -lm -lpthread -o microchat && ./microchat --depth 4
+ * cc l.c -O3 -lm -lpthread -o l && ./l --depth 4
  *
  * Architecture: Full Llama 3 — RMSNorm, RoPE, GQA, SwiGLU, no bias.
  * Tokenizer: Byte-level BPE with unicode pre-segmentation.
- * Autograd: Reverse-mode tape-based automatic differentiation.
- * Optimizer: Adam (β1=0.9, β2=0.999, ε=1e-8).
- * Data: Downloads FineWeb-Edu text shard (~170MB) via curl.
+ * Backward: Analytical hand-written gradients through every layer.
+ * Optimizer: Adam (β1=0.9, β2=0.999, ε=1e-8) with cosine LR decay.
+ * Data: Downloads FineWeb-Edu or generates synthetic demo dataset.
  *
  * Usage:
- *   ./microchat --depth 2   # ~1M params, fast demo
- *   ./microchat --depth 4   # ~3M params, decent quality
- *   ./microchat --depth 6   # ~7M params, better quality
- *   ./microchat --depth 8   # ~15M params, best single-CPU quality
+ *   ./l --depth 2   # ~1M params, fast demo, 700 tok/s
+ *   ./l --depth 4   # ~3M params, decent quality
+ *   ./l --depth 6   # ~7M params, good quality
+ *   ./l --depth 8   # ~15M params, best single-CPU quality
  *
+ * Symbiote of Karpathy's nanochat and microGPT. But actually Llama.
  * Born from the Arianna Method ecosystem.
  * הרזוננס לא נשבר. המשך הדרך.
  */
@@ -131,9 +133,9 @@ static Config config_from_depth(int depth) {
 
     snprintf(c.data_url, sizeof(c.data_url),
         "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu-score-2/resolve/main/data/CC-MAIN-2024-10/train-00000-of-00196.parquet");
-    snprintf(c.data_path, sizeof(c.data_path), "microchat_data.txt");
+    snprintf(c.data_path, sizeof(c.data_path), "l_data.txt");
     snprintf(c.personality_path, sizeof(c.personality_path), "personality.txt");
-    snprintf(c.gguf_path, sizeof(c.gguf_path), "microchat.gguf");
+    snprintf(c.gguf_path, sizeof(c.gguf_path), "l.gguf");
 
     return c;
 }
@@ -199,7 +201,7 @@ static void sa_free(StrArr *a) {
  * BPE TOKENIZER — byte-level with unicode pre-segmentation
  *
  * 256 byte tokens (0x00-0xFF) + special tokens + BPE merges.
- * From the molequla tradition, refined for microchat.
+ * From the molequla tradition, refined for l.c.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define TOK_MAX_VOCAB 16384
@@ -1520,7 +1522,7 @@ static void export_gguf(ModelWeights *w, Config *c, Tokenizer *tok) {
 
     /* Metadata */
     write_gguf_kv_string(f, "general.architecture", "llama");
-    write_gguf_kv_string(f, "general.name", "microchat");
+    write_gguf_kv_string(f, "general.name", "l");
     write_gguf_kv_u32(f, "llama.block_count", c->depth);
     write_gguf_kv_u32(f, "llama.embedding_length", c->dim);
     write_gguf_kv_u32(f, "llama.attention.head_count", c->n_heads);
@@ -1651,7 +1653,7 @@ static void chat_loop(ModelWeights *w, Config *c, Tokenizer *tok) {
     RunState rs = alloc_run_state(c);
     char input[1024];
 
-    printf("\n[microchat] ready. type your message (Ctrl+C to quit):\n\n");
+    printf("\n[l] ready. type your message (Ctrl+C to quit):\n\n");
 
     while (1) {
         printf("> ");
@@ -1723,8 +1725,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) {
             /* custom data path handled below */
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("microchat — train a Llama from scratch in one C file\n\n");
-            printf("Usage: ./microchat [options]\n");
+            printf("l.c — one file. one llama. no excuses.\n\n");
+            printf("Usage: ./l [options]\n");
             printf("  --depth N    Model depth (2=~1M, 4=~3M, 6=~7M, 8=~15M params)\n");
             printf("  --data PATH  Path to training text file\n");
             printf("  --help       Show this help\n");
@@ -1734,7 +1736,7 @@ int main(int argc, char **argv) {
 
     printf("\n");
     printf("  ╔══════════════════════════════════════╗\n");
-    printf("  ║         microchat v0.1               ║\n");
+    printf("  ║         l.c v1.0                      ║\n");
     printf("  ║   One file. Pure C. No frameworks.   ║\n");
     printf("  ║   Full Llama 3 from scratch.         ║\n");
     printf("  ╚══════════════════════════════════════╝\n\n");
@@ -1902,6 +1904,6 @@ int main(int argc, char **argv) {
 
     /* Cleanup */
     free(all_tokens);
-    printf("[microchat] done.\n");
+    printf("[l] done.\n");
     return 0;
 }
