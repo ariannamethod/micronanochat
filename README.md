@@ -72,7 +72,7 @@ all of this. one file. one binary.
 
 ## architecture
 
-not a toy GPT. this is **Llama 3**.
+actually this is **Llama 3**.
 
 ```
 Token Embedding (untied)
