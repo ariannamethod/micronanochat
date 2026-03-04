@@ -5,7 +5,7 @@
  * no frameworks. no pip install. no "works on my machine."
  * just malloc, free, and knowing what a gradient is.
  *
- * cc l.c -O3 -lm -lpthread -o l && ./l --depth 4
+ * cc l.c -O3 -lm -lpthread -fopenmp -o l && ./l --depth 4
  *
  * what happens: downloads data → trains BPE tokenizer → builds Llama 3 →
  * trains it with hand-written backward passes → finetunes on personality →
@@ -18,6 +18,7 @@
  *
  * symbiote of Karpathy's nanochat and microGPT. but actually Llama.
  * born from the Arianna Method ecosystem. raised by spite and curiosity.
+ * now with OpenMP parallelization, fp16 KV cache, and NTK-aware RoPE.
  */
 
 #include <stdio.h>
@@ -31,6 +32,10 @@
 #include <float.h>
 #include <stdint.h>
 #include <errno.h>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * CONFIGURATION — one knob to rule them all.
@@ -49,6 +54,8 @@ typedef struct {
     int seq_len;        /* context window */
     float norm_eps;     /* RMSNorm epsilon */
     float rope_theta;   /* RoPE base frequency */
+    float rope_scaling; /* NTK scaling factor (>1 extends context) */
+    int fp16_cache;     /* half-precision KV cache */
 
     /* training */
     float lr;           /* learning rate */
@@ -106,6 +113,8 @@ static Config config_from_depth(int depth) {
     c.seq_len = 256;    /* 256 tokens of context. enough to be dangerous. */
     c.norm_eps = 1e-5f;
     c.rope_theta = 10000.0f;
+    c.rope_scaling = 1.0f;  /* >1 extends context via NTK */
+    c.fp16_cache = 0;       /* half-precision KV cache off by default */
 
     /* Training hyperparams scale with model size */
     c.lr = 3e-4f;
@@ -148,6 +157,34 @@ static long count_params(Config *c) {
     per_layer += (long)c->dim * 2;                           /* 2x RMSNorm */
     long total = embed + per_layer * c->depth + c->dim;      /* + final norm */
     return total;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * HALF-PRECISION — software fp16 for KV cache. saves half the memory.
+ * IEEE 754 binary16: 1 sign, 5 exponent, 10 mantissa. good enough for attention.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+typedef uint16_t half;
+
+static half float2half(float f) {
+    uint32_t x = *(uint32_t*)&f;
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t exp = ((x >> 23) & 0xFF) - 112;
+    uint32_t mant = (x >> 13) & 0x3FF;
+    if (exp <= 0) return sign;
+    if (exp > 30) return sign | 0x7C00;
+    return sign | (exp << 10) | mant;
+}
+
+static float half2float(half h) {
+    uint32_t sign = (h >> 15) & 0x1;
+    int32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) { f = sign << 31; }
+    else if (exp == 31) { f = (sign << 31) | 0x7F800000 | (mant << 13); }
+    else { f = (sign << 31) | ((exp + 112) << 23) | (mant << 13); }
+    return *(float*)&f;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -739,9 +776,11 @@ static void rmsnorm(float *out, float *x, float *weight, int dim, float eps) {
 
 /* Matrix-vector multiply: out = W @ x, W is [rows, cols] */
 static void matvec(float *out, float *W, float *x, int rows, int cols) {
+    #pragma omp parallel for
     for (int i = 0; i < rows; i++) {
         float s = 0.0f;
         float *row = W + i * cols;
+        #pragma omp simd reduction(+:s)
         for (int j = 0; j < cols; j++) s += row[j] * x[j];
         out[i] = s;
     }
@@ -761,7 +800,7 @@ static void softmax(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] /= sum;
 }
 
-/* Apply RoPE to a single head vector */
+/* Apply RoPE to a single head vector (with NTK scaling support) */
 static void apply_rope(float *vec, int pos, float *cos_cache, float *sin_cache, int head_dim) {
     int half = head_dim / 2;
     int off = pos * half;
@@ -772,14 +811,26 @@ static void apply_rope(float *vec, int pos, float *cos_cache, float *sin_cache, 
     }
 }
 
-/* Runtime state for inference */
+/* RoPE backward (same rotation, transposed) */
+static void rope_bwd_ntk(float *dvec, int pos, float *cos_cache, float *sin_cache, int head_dim) {
+    int half = head_dim / 2;
+    int off = pos * half;
+    for (int i = 0; i < half; i++) {
+        float d0 = dvec[i], d1 = dvec[i + half];
+        dvec[i]        =  d0 * cos_cache[off+i] + d1 * sin_cache[off+i];
+        dvec[i + half] = -d0 * sin_cache[off+i] + d1 * cos_cache[off+i];
+    }
+}
+
+/* Runtime state for inference — KV cache is either float or half */
 typedef struct {
     float *x, *xb, *xb2;
     float *hb, *hb2;
     float *q, *k, *v;
     float *att;
     float *logits;
-    float *key_cache, *value_cache;
+    void *key_cache, *value_cache; /* float* or half* depending on fp16_cache */
+    int use_half;
     float *cos_cache, *sin_cache;
 } RunState;
 
@@ -796,17 +847,25 @@ static RunState alloc_run_state(Config *c) {
     s.v      = calloc(kv_dim, sizeof(float));
     s.att    = calloc(c->n_heads * c->seq_len, sizeof(float));
     s.logits = calloc(c->vocab_size, sizeof(float));
-    s.key_cache   = calloc(c->depth * c->seq_len * kv_dim, sizeof(float));
-    s.value_cache = calloc(c->depth * c->seq_len * kv_dim, sizeof(float));
+    s.use_half = c->fp16_cache;
+    {
+        size_t elem = c->fp16_cache ? sizeof(half) : sizeof(float);
+        size_t cache_n = c->depth * c->seq_len * kv_dim;
+        s.key_cache   = calloc(cache_n, elem);
+        s.value_cache = calloc(cache_n, elem);
+    }
 
     int half = c->head_dim / 2;
     s.cos_cache = calloc(c->seq_len * half, sizeof(float));
     s.sin_cache = calloc(c->seq_len * half, sizeof(float));
 
-    /* Precompute RoPE */
+    /* Precompute RoPE (with NTK scaling if rope_scaling > 1) */
     for (int pos = 0; pos < c->seq_len; pos++) {
         for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(c->rope_theta, (float)(2*i) / (float)c->head_dim);
+            float theta = c->rope_theta;
+            if (c->rope_scaling > 1.0f)
+                theta *= powf(c->rope_scaling, (float)c->head_dim / (c->head_dim - 2.0f));
+            float freq = 1.0f / powf(theta, (float)(2*i) / (float)c->head_dim);
             float angle = (float)pos * freq;
             s.cos_cache[pos * half + i] = cosf(angle);
             s.sin_cache[pos * half + i] = sinf(angle);
@@ -852,12 +911,20 @@ static float *forward_token(ModelWeights *w, Config *c, RunState *s, int token, 
         for (int h = 0; h < c->n_kv_heads; h++)
             apply_rope(s->k + h * hd, pos, s->cos_cache, s->sin_cache, hd);
 
-        /* Store K, V in cache */
+        /* Store K, V in cache (fp16 or fp32) */
         int cache_off = l * c->seq_len * kv_dim + pos * kv_dim;
-        memcpy(s->key_cache + cache_off, s->k, kv_dim * sizeof(float));
-        memcpy(s->value_cache + cache_off, s->v, kv_dim * sizeof(float));
+        if (s->use_half) {
+            half *kc = (half*)s->key_cache, *vc = (half*)s->value_cache;
+            for (int i = 0; i < kv_dim; i++) kc[cache_off + i] = float2half(s->k[i]);
+            for (int i = 0; i < kv_dim; i++) vc[cache_off + i] = float2half(s->v[i]);
+        } else {
+            float *kc = (float*)s->key_cache, *vc = (float*)s->value_cache;
+            memcpy(kc + cache_off, s->k, kv_dim * sizeof(float));
+            memcpy(vc + cache_off, s->v, kv_dim * sizeof(float));
+        }
 
         /* Multi-head attention with GQA */
+        #pragma omp parallel for
         for (int h = 0; h < c->n_heads; h++) {
             int kvh = h / head_group;
             float *qh = s->q + h * hd;
@@ -866,7 +933,13 @@ static float *forward_token(ModelWeights *w, Config *c, RunState *s, int token, 
             for (int t = 0; t <= pos; t++) {
                 int k_off = l * c->seq_len * kv_dim + t * kv_dim + kvh * hd;
                 float dot = 0.0f;
-                for (int d = 0; d < hd; d++) dot += qh[d] * s->key_cache[k_off + d];
+                if (s->use_half) {
+                    half *kc = (half*)s->key_cache;
+                    for (int d = 0; d < hd; d++) dot += qh[d] * half2float(kc[k_off + d]);
+                } else {
+                    float *kc = (float*)s->key_cache;
+                    for (int d = 0; d < hd; d++) dot += qh[d] * kc[k_off + d];
+                }
                 att[t] = dot * scale;
             }
             softmax(att, pos + 1);
@@ -876,7 +949,13 @@ static float *forward_token(ModelWeights *w, Config *c, RunState *s, int token, 
             for (int t = 0; t <= pos; t++) {
                 float a = att[t];
                 int v_off = l * c->seq_len * kv_dim + t * kv_dim + kvh * hd;
-                for (int d = 0; d < hd; d++) xb2h[d] += a * s->value_cache[v_off + d];
+                if (s->use_half) {
+                    half *vc = (half*)s->value_cache;
+                    for (int d = 0; d < hd; d++) xb2h[d] += a * half2float(vc[v_off + d]);
+                } else {
+                    float *vc = (float*)s->value_cache;
+                    for (int d = 0; d < hd; d++) xb2h[d] += a * vc[v_off + d];
+                }
             }
         }
 
@@ -995,7 +1074,10 @@ static TrainState alloc_train_state(Config *c) {
     s.sin_cache = calloc(T * half, sizeof(float));
     for (int pos = 0; pos < T; pos++) {
         for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(c->rope_theta, (float)(2*i) / (float)c->head_dim);
+            float theta = c->rope_theta;
+            if (c->rope_scaling > 1.0f)
+                theta *= powf(c->rope_scaling, (float)c->head_dim / (c->head_dim - 2.0f));
+            float freq = 1.0f / powf(theta, (float)(2*i) / (float)c->head_dim);
             float angle = (float)pos * freq;
             s.cos_cache[pos * half + i] = cosf(angle);
             s.sin_cache[pos * half + i] = sinf(angle);
@@ -1006,6 +1088,7 @@ static TrainState alloc_train_state(Config *c) {
 
 /* Matrix multiply: C[M,N] = A[M,K] @ B[N,K]^T */
 static void matmul_fwd(float *C, float *A, float *B, int M, int N, int K) {
+    #pragma omp parallel for
     for (int m = 0; m < M; m++) {
         float *cm = C + m * N;
         float *am = A + m * K;
@@ -1509,6 +1592,7 @@ static void export_gguf(ModelWeights *w, Config *c, Tokenizer *tok) {
 
     /* Count metadata KV pairs */
     int n_metadata = 12; /* architecture + model config + tokenizer basics */
+    if (c->rope_scaling > 1.0f) n_metadata++;
 
     /* Header */
     write_u32(f, 0x46554747); /* magic "GGUF" */
@@ -1527,6 +1611,8 @@ static void export_gguf(ModelWeights *w, Config *c, Tokenizer *tok) {
     write_gguf_kv_u32(f, "llama.context_length", c->seq_len);
     write_gguf_kv_f32(f, "llama.attention.layer_norm_rms_epsilon", c->norm_eps);
     write_gguf_kv_f32(f, "llama.rope.freq_base", c->rope_theta);
+    if (c->rope_scaling > 1.0f)
+        write_gguf_kv_f32(f, "llama.rope.scaling_factor", c->rope_scaling);
     write_gguf_kv_string(f, "tokenizer.ggml.model", "gpt2");
     write_gguf_kv_u32(f, "tokenizer.ggml.vocab_size", c->vocab_size); /* non-standard but useful */
 
@@ -1664,8 +1750,9 @@ static void chat_loop(ModelWeights *w, Config *c, Tokenizer *tok) {
 
         /* Reset KV cache */
         int kv_dim = c->n_kv_heads * c->head_dim;
-        memset(rs.key_cache, 0, c->depth * c->seq_len * kv_dim * sizeof(float));
-        memset(rs.value_cache, 0, c->depth * c->seq_len * kv_dim * sizeof(float));
+        size_t cache_bytes = c->depth * c->seq_len * kv_dim * (c->fp16_cache ? sizeof(half) : sizeof(float));
+        memset(rs.key_cache, 0, cache_bytes);
+        memset(rs.value_cache, 0, cache_bytes);
 
         /* Encode input */
         int n_input_ids;
@@ -1726,9 +1813,11 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("l.c — one file. one llama. no excuses.\n\n");
             printf("Usage: ./l [options]\n");
-            printf("  --depth N    Model depth (2=~1M, 4=~3M, 6=~7M, 8=~15M params)\n");
-            printf("  --data PATH  Path to training text file\n");
-            printf("  --help       Show this help\n");
+            printf("  --depth N       Model depth (2=~1M, 4=~3M, 6=~7M, 8=~15M params)\n");
+            printf("  --data PATH     Path to training text file\n");
+            printf("  --fp16-cache    Half-precision KV cache (saves memory)\n");
+            printf("  --rope-scale F  NTK scaling for RoPE (>1 extends context)\n");
+            printf("  --help          Show this help\n");
             return 0;
         }
     }
@@ -1741,11 +1830,14 @@ int main(int argc, char **argv) {
 
     Config c = config_from_depth(depth);
 
-    /* Parse data path override */
+    /* Parse overrides */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--data") == 0 && i + 1 < argc)
             snprintf(c.data_path, sizeof(c.data_path), "%s", argv[i+1]);
-        }
+        else if (strcmp(argv[i], "--fp16-cache") == 0)
+            c.fp16_cache = 1;
+        else if (strcmp(argv[i], "--rope-scale") == 0 && i + 1 < argc)
+            c.rope_scaling = atof(argv[++i]);
     }
 
     /* ── Step 1: Get data ── */
