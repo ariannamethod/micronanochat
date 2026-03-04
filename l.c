@@ -149,8 +149,7 @@ static Config config_from_depth(int depth) {
 
     c.personality_steps = 100;
 
-    snprintf(c.data_url, sizeof(c.data_url),
-        "https://datasets-server.huggingface.co/rows?dataset=HuggingFaceFW/fineweb-edu&config=sample-10BT&split=train&offset=0&length=5000"); /* FineWeb-Edu via HF API */
+    snprintf(c.data_url, sizeof(c.data_url), "fineweb-edu"); /* marker: triggers HF API download */
     snprintf(c.data_path, sizeof(c.data_path), "l_data.txt");
     snprintf(c.personality_path, sizeof(c.personality_path), "personality.txt");
     snprintf(c.gguf_path, sizeof(c.gguf_path), "l.gguf");
@@ -1700,7 +1699,10 @@ static int load_parquet(const char *path, const char *out_path, const char *col_
     return total>0?0:-1;
 }
 
-/* Download training text — HF API → JSON → text, or synthetic fallback */
+/* Download training text — HF rows API paginated, or synthetic fallback */
+#define HF_BATCH 100
+#define HF_PAGES 50
+
 static int download_data(Config *c) {
     struct stat st;
     if (stat(c->data_path, &st) == 0 && st.st_size > 1000) {
@@ -1709,26 +1711,37 @@ static int download_data(Config *c) {
         return 0;
     }
     if (c->data_url[0]) {
-        printf("[data] fetching from HuggingFace API...\n");
-        char tmp[280]; snprintf(tmp,sizeof(tmp),"%s.json",c->data_path);
-        char cmd[1024];
-        snprintf(cmd,sizeof(cmd),"curl -sL '%s' -o '%s'",c->data_url,tmp);
-        int r=system(cmd);
-        if(r==0&&stat(tmp,&st)==0&&st.st_size>1000){
-            FILE *jf=fopen(tmp,"r"); if(jf){
-                char *json=malloc(st.st_size+1);
-                int jl=(int)fread(json,1,st.st_size,jf); json[jl]=0; fclose(jf);
-                FILE *out=fopen(c->data_path,"w");
-                if(out){ int n=hf_extract_texts(json,jl,out); fclose(out);
-                    printf("[data] extracted %d texts from HuggingFace\n",n);
-                    free(json); unlink(tmp);
-                    if(n>0)return 0;
-                } else free(json);
-            }
+        printf("[data] fetching FineWeb-Edu from HuggingFace (%d pages)...\n", HF_PAGES);
+        FILE *out = fopen(c->data_path, "w"); if (!out) goto synthetic;
+        char tmp[280]; snprintf(tmp, sizeof(tmp), "%s.json", c->data_path);
+        int total = 0;
+        for (int page = 0; page < HF_PAGES; page++) {
+            char cmd[1024];
+            snprintf(cmd, sizeof(cmd),
+                "curl -sL 'https://datasets-server.huggingface.co/rows"
+                "?dataset=HuggingFaceFW/fineweb-edu"
+                "&config=sample-10BT&split=train&offset=%d&length=%d' -o '%s'",
+                page * HF_BATCH, HF_BATCH, tmp);
+            if (system(cmd) != 0) continue;
+            if (stat(tmp, &st) != 0 || st.st_size < 500) continue;
+            FILE *jf = fopen(tmp, "r"); if (!jf) continue;
+            char *json = malloc(st.st_size + 1);
+            int jl = (int)fread(json, 1, st.st_size, jf); json[jl] = 0; fclose(jf);
+            int n = hf_extract_texts(json, jl, out);
+            free(json); total += n;
+            if ((page + 1) % 10 == 0)
+                printf("[data] page %d/%d — %d texts so far\n", page + 1, HF_PAGES, total);
         }
-        unlink(tmp);
+        fclose(out); unlink(tmp);
+        if (total > 0) {
+            stat(c->data_path, &st);
+            printf("[data] downloaded %d texts (%.1f MB) from FineWeb-Edu\n",
+                   total, (float)st.st_size / 1048576.0f);
+            return 0;
+        }
         printf("[data] HuggingFace download failed\n");
     }
+    synthetic:
     printf("[data] creating synthetic dataset for demo...\n");
     FILE *f = fopen(c->data_path, "w");
     if (!f) return -1;
