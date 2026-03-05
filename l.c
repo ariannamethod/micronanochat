@@ -49,6 +49,31 @@
   #endif
 #endif
 
+/* CUDA ACCELERATION — cuBLAS for GPU matmul. A100 goes brrr.
+ *   nvcc -c ariannamethod_cuda.cu -lcublas -O3
+ *   cc l.c ariannamethod_cuda.o -O3 -lm -lpthread -DUSE_CUDA -lcublas -lcudart -L/usr/local/cuda/lib64 -o l
+ * uses ariannamethod_cuda.h/cu from the Arianna Method ecosystem. */
+#ifdef USE_CUDA
+#include "ariannamethod_cuda.h"
+/* GPU temp buffers for activations/results — weights are resident on GPU via Tensor.d_data */
+static float *d_tmp_a, *d_tmp_c;  /* a=activation, c=result */
+static float *d_tmp_b;            /* extra for bwd */
+static int d_tmp_size = 0;
+static void gpu_ensure_tmp(int needed) {
+    if (needed <= d_tmp_size) return;
+    if (d_tmp_a) { gpu_free(d_tmp_a); gpu_free(d_tmp_b); gpu_free(d_tmp_c); }
+    d_tmp_a = gpu_alloc(needed);
+    d_tmp_b = gpu_alloc(needed);
+    d_tmp_c = gpu_alloc(needed);
+    d_tmp_size = needed;
+}
+
+/* gpu_upload_weights and gpu_resync_weights defined after Tensor struct */
+#define GPU(t) ((t)->d_data)
+#else
+#define GPU(t) NULL
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * CONFIGURATION — one knob to rule them all.
  * you turn depth, everything else figures itself out.
@@ -133,19 +158,17 @@ static Config config_from_depth(int depth) {
     c.batch_size = 4;
     c.warmup_steps = 100;
     c.weight_decay = 0.01f;
-    c.log_every = 20;
+    c.log_every = depth > 4 ? 100 : 20;
     c.eval_every = 100;
 
-    /* Compute tokens budget: N * 8 (nanochat ratio) */
-    /* Rough param count: ~12 * depth * dim^2 */
-    long params = 12L * depth * c.dim * c.dim;
-    long tokens_budget = params * 8;
-    c.max_steps = (int)(tokens_budget / (c.batch_size * c.seq_len));
-    if (c.max_steps < 200) c.max_steps = 200;
-    if (c.max_steps > 2000) c.max_steps = 2000; /* mercy on the silicon */
+    /* steps scale with depth: small models train fast, big ones need time.
+     * nanoGPT: 10M params, 5000 steps, batch 64. we scale proportionally. */
+    c.max_steps = depth * depth * 300;
+    if (c.max_steps < 500) c.max_steps = 500;
+    if (c.max_steps > 50000) c.max_steps = 50000;
 
     /* BPE: more merges for bigger vocab with bigger models */
-    c.bpe_merges = 4000;
+    c.bpe_merges = 2000;
 
     c.personality_steps = 100;
 
@@ -630,7 +653,23 @@ typedef struct {
     float *data;
     int size;       /* total elements */
     int rows, cols; /* for 2D tensors */
+#ifdef USE_CUDA
+    float *d_data;  /* GPU-resident copy — uploaded once, resynced after Adam */
+#endif
 } Tensor;
+
+#ifdef USE_CUDA
+static void gpu_upload_weights(Tensor **tensors, int n) {
+    for (int i = 0; i < n; i++) {
+        tensors[i]->d_data = gpu_alloc(tensors[i]->size);
+        gpu_upload(tensors[i]->d_data, tensors[i]->data, tensors[i]->size);
+    }
+}
+static void gpu_resync_weights(Tensor **tensors, int n) {
+    for (int i = 0; i < n; i++)
+        gpu_upload(tensors[i]->d_data, tensors[i]->data, tensors[i]->size);
+}
+#endif
 
 static Tensor *tensor_new(int size) {
     Tensor *t = calloc(1, sizeof(Tensor));
@@ -1097,12 +1136,23 @@ static TrainState alloc_train_state(Config *c) {
     return s;
 }
 
-/* Matrix multiply: C[M,N] = A[M,K] @ B[N,K]^T */
-static void matmul_fwd(float *C, float *A, float *B, int M, int N, int K) {
-#ifdef USE_BLAS
+/* Matrix multiply: C[M,N] = A[M,K] @ B[N,K]^T
+ * d_B = GPU-resident weight pointer (NULL = upload B every time) */
+static void matmul_fwd(float *C, float *A, float *B, int M, int N, int K,
+                        float *d_B) {
+#ifdef USE_CUDA
+    int biggest = M*K; if(M*N>biggest)biggest=M*N;
+    gpu_ensure_tmp(biggest);
+    gpu_upload(d_tmp_a, A, M * K);
+    float *d_weight = d_B ? d_B : d_tmp_b;
+    if (!d_B) { if(N*K>biggest)gpu_ensure_tmp(N*K); gpu_upload(d_tmp_b, B, N * K); }
+    gpu_sgemm_nt(M, N, K, d_tmp_a, d_weight, d_tmp_c);
+    gpu_download(C, d_tmp_c, M * N);
+#elif defined(USE_BLAS)
+    (void)d_B;
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
-    #pragma omp parallel for
+    (void)d_B;
     for (int m = 0; m < M; m++) {
         float *cm = C + m * N;
         float *am = A + m * K;
@@ -1116,10 +1166,35 @@ static void matmul_fwd(float *C, float *A, float *B, int M, int N, int K) {
 #endif
 }
 
-/* C = A @ B^T backward: dA += dC @ B, dB += dC^T @ A */
+/* C = A @ B^T backward: dA += dC @ B, dB += dC^T @ A
+ * d_B = GPU-resident weight pointer (NULL = upload B every time) */
 static void matmul_bwd(float *dA, float *dB, float *dC, float *A, float *B,
-                        int M, int N, int K) {
-#ifdef USE_BLAS
+                        int M, int N, int K, float *d_B) {
+#ifdef USE_CUDA
+    int biggest = M*K; if(N*K>biggest)biggest=N*K; if(M*N>biggest)biggest=M*N;
+    gpu_ensure_tmp(biggest);
+    gpu_upload(d_tmp_a, dC, M * N);
+    float *d_weight = d_B ? d_B : d_tmp_b;
+    if (!d_B) gpu_upload(d_tmp_b, B, N * K);
+    gpu_sgemm_nn(M, K, N, d_tmp_a, d_weight, d_tmp_c);
+    {
+        static float *bwd_tmp = NULL;
+        static int bwd_tmp_size = 0;
+        int need = M * K > N * K ? M * K : N * K;
+        if (need > bwd_tmp_size) {
+            free(bwd_tmp);
+            bwd_tmp = malloc(need * sizeof(float));
+            bwd_tmp_size = need;
+        }
+        gpu_download(bwd_tmp, d_tmp_c, M * K);
+        for (int i = 0; i < M * K; i++) dA[i] += bwd_tmp[i];
+        gpu_upload(d_tmp_b, A, M * K);
+        gpu_sgemm_tn(N, K, M, d_tmp_a, d_tmp_b, d_tmp_c);
+        gpu_download(bwd_tmp, d_tmp_c, N * K);
+        for (int i = 0; i < N * K; i++) dB[i] += bwd_tmp[i];
+    }
+#elif defined(USE_BLAS)
+    (void)d_B;
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, K, N, 1.0f, dC, N, B, K, 1.0f, dA, K);
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, N, K, M, 1.0f, dC, N, A, K, 1.0f, dB, K);
 #else
@@ -1206,9 +1281,9 @@ static float train_forward(ModelWeights *w, Config *c, TrainState *s,
         rmsnorm_fwd_seq(la->xn, s->residual, lw->attn_norm->data, T, D, c->norm_eps);
 
         /* Q, K, V projections */
-        matmul_fwd(la->q, la->xn, lw->wq->data, T, qd, D);
-        matmul_fwd(la->k, la->xn, lw->wk->data, T, kv, D);
-        matmul_fwd(la->v, la->xn, lw->wv->data, T, kv, D);
+        matmul_fwd(la->q, la->xn, lw->wq->data, T, qd, D, GPU(lw->wq));
+        matmul_fwd(la->k, la->xn, lw->wk->data, T, kv, D, GPU(lw->wk));
+        matmul_fwd(la->v, la->xn, lw->wv->data, T, kv, D, GPU(lw->wv));
 
         /* RoPE */
         for (int t = 0; t < T; t++) {
@@ -1250,19 +1325,19 @@ static float train_forward(ModelWeights *w, Config *c, TrainState *s,
 
         /* Output projection + residual */
         float *attn_proj = calloc(T * D, sizeof(float));
-        matmul_fwd(attn_proj, la->attn_out, lw->wo->data, T, D, qd);
+        matmul_fwd(attn_proj, la->attn_out, lw->wo->data, T, D, qd, GPU(lw->wo));
         for (int i = 0; i < T * D; i++) s->residual[i] += attn_proj[i];
         free(attn_proj);
         memcpy(la->res_after_attn, s->residual, T * D * sizeof(float));
 
         /* FFN: norm → gate/up → SwiGLU → down → residual */
         rmsnorm_fwd_seq(la->ffn_xn, s->residual, lw->ffn_norm->data, T, D, c->norm_eps);
-        matmul_fwd(la->gate_pre, la->ffn_xn, lw->w_gate->data, T, H, D);
-        matmul_fwd(la->up_pre, la->ffn_xn, lw->w_up->data, T, H, D);
+        matmul_fwd(la->gate_pre, la->ffn_xn, lw->w_gate->data, T, H, D, GPU(lw->w_gate));
+        matmul_fwd(la->up_pre, la->ffn_xn, lw->w_up->data, T, H, D, GPU(lw->w_up));
         for (int i = 0; i < T * H; i++)
             la->swiglu[i] = silu(la->gate_pre[i]) * la->up_pre[i];
         float *ffn_proj = calloc(T * D, sizeof(float));
-        matmul_fwd(ffn_proj, la->swiglu, lw->w_down->data, T, D, H);
+        matmul_fwd(ffn_proj, la->swiglu, lw->w_down->data, T, D, H, GPU(lw->w_down));
         for (int i = 0; i < T * D; i++) s->residual[i] += ffn_proj[i];
         free(ffn_proj);
     }
@@ -1271,7 +1346,7 @@ static float train_forward(ModelWeights *w, Config *c, TrainState *s,
     s->final_normed = calloc(T * D, sizeof(float));
     rmsnorm_fwd_seq(s->final_normed, s->residual, w->output_norm->data, T, D, c->norm_eps);
     s->logits = calloc(T * c->vocab_size, sizeof(float));
-    matmul_fwd(s->logits, s->final_normed, w->output->data, T, c->vocab_size, D);
+    matmul_fwd(s->logits, s->final_normed, w->output->data, T, c->vocab_size, D, GPU(w->output));
 
     /* 4. Cross-entropy loss */
     float total_loss = 0.0f;
@@ -1322,7 +1397,7 @@ static void train_backward(ModelWeights *w, Config *c, TrainState *s,
 
     /* ── LM head backward ── */
     float *d_fn = calloc(T * D, sizeof(float));
-    matmul_bwd(d_fn, grads[1], d_logits, s->final_normed, w->output->data, T, V, D);
+    matmul_bwd(d_fn, grads[1], d_logits, s->final_normed, w->output->data, T, V, D, GPU(w->output));
 
     /* ── Final norm backward ── */
     memset(s->d_residual, 0, T * D * sizeof(float));
@@ -1340,7 +1415,7 @@ static void train_backward(ModelWeights *w, Config *c, TrainState *s,
         /* === FFN backward === */
         /* ffn_proj (= swiglu @ w_down^T) backward */
         memset(s->d_swiglu, 0, T * H * sizeof(float));
-        matmul_bwd(s->d_swiglu, grads[gi+8], s->d_residual, la->swiglu, lw->w_down->data, T, D, H);
+        matmul_bwd(s->d_swiglu, grads[gi+8], s->d_residual, la->swiglu, lw->w_down->data, T, D, H, GPU(lw->w_down));
 
         /* SwiGLU backward: out = silu(gate) * up */
         for (int i = 0; i < T * H; i++) {
@@ -1352,8 +1427,8 @@ static void train_backward(ModelWeights *w, Config *c, TrainState *s,
         }
 
         memset(s->d_ffn_xn, 0, T * D * sizeof(float));
-        matmul_bwd(s->d_ffn_xn, grads[gi+6], s->d_gate, la->ffn_xn, lw->w_gate->data, T, H, D);
-        matmul_bwd(s->d_ffn_xn, grads[gi+7], s->d_up,   la->ffn_xn, lw->w_up->data,   T, H, D);
+        matmul_bwd(s->d_ffn_xn, grads[gi+6], s->d_gate, la->ffn_xn, lw->w_gate->data, T, H, D, GPU(lw->w_gate));
+        matmul_bwd(s->d_ffn_xn, grads[gi+7], s->d_up,   la->ffn_xn, lw->w_up->data,   T, H, D, GPU(lw->w_up));
 
         /* FFN norm backward */
         rmsnorm_bwd_seq(s->d_residual, grads[gi+5], s->d_ffn_xn,
@@ -1362,7 +1437,7 @@ static void train_backward(ModelWeights *w, Config *c, TrainState *s,
         /* === Attention backward === */
         /* Output projection backward */
         memset(s->d_attn_out, 0, T * qd * sizeof(float));
-        matmul_bwd(s->d_attn_out, grads[gi+4], s->d_residual, la->attn_out, lw->wo->data, T, D, qd);
+        matmul_bwd(s->d_attn_out, grads[gi+4], s->d_residual, la->attn_out, lw->wo->data, T, D, qd, GPU(lw->wo));
 
         /* Attention score backward */
         memset(s->d_q, 0, T * qd * sizeof(float));
@@ -1415,9 +1490,9 @@ static void train_backward(ModelWeights *w, Config *c, TrainState *s,
 
         /* Q, K, V projection backward */
         memset(s->d_xn, 0, T * D * sizeof(float));
-        matmul_bwd(s->d_xn, grads[gi+1], s->d_q, la->xn, lw->wq->data, T, qd, D);
-        matmul_bwd(s->d_xn, grads[gi+2], s->d_k, la->xn, lw->wk->data, T, kv, D);
-        matmul_bwd(s->d_xn, grads[gi+3], s->d_v, la->xn, lw->wv->data, T, kv, D);
+        matmul_bwd(s->d_xn, grads[gi+1], s->d_q, la->xn, lw->wq->data, T, qd, D, GPU(lw->wq));
+        matmul_bwd(s->d_xn, grads[gi+2], s->d_k, la->xn, lw->wk->data, T, kv, D, GPU(lw->wk));
+        matmul_bwd(s->d_xn, grads[gi+3], s->d_v, la->xn, lw->wv->data, T, kv, D, GPU(lw->wv));
 
         /* Attention norm backward → d_residual for prev layer */
         float *d_save = calloc(T * D, sizeof(float));
@@ -1786,6 +1861,130 @@ static char *load_text(const char *path, int *out_len) {
  * without committees, standards bodies, or 14 competing serialization formats.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * CHECKPOINT — binary save/load so you don't retrain every time you want to chat.
+ * format: magic(4) + config fields + tokenizer(vocab+merges) + all weights.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+#define CKPT_MAGIC 0x4C4C414D /* "LLAM" */
+
+static void save_checkpoint(const char *path, ModelWeights *w, Config *c, Tokenizer *tok) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("[ckpt] cannot create %s\n", path); return; }
+
+    uint32_t magic = CKPT_MAGIC;
+    fwrite(&magic, 4, 1, f);
+    fwrite(&c->depth, 4, 1, f);
+    fwrite(&c->dim, 4, 1, f);
+    fwrite(&c->n_heads, 4, 1, f);
+    fwrite(&c->n_kv_heads, 4, 1, f);
+    fwrite(&c->head_dim, 4, 1, f);
+    fwrite(&c->hidden_dim, 4, 1, f);
+    fwrite(&c->vocab_size, 4, 1, f);
+    fwrite(&c->seq_len, 4, 1, f);
+    fwrite(&c->norm_eps, 4, 1, f);
+    fwrite(&c->rope_theta, 4, 1, f);
+
+    /* tokenizer: vocab strings + merges */
+    fwrite(&tok->vocab_size, 4, 1, f);
+    for (int i = 0; i < tok->vocab_size; i++) {
+        int len = tok->tokens[i] ? (int)strlen(tok->tokens[i]) : 0;
+        fwrite(&len, 4, 1, f);
+        if (len > 0) fwrite(tok->tokens[i], 1, len, f);
+    }
+    fwrite(&tok->n_merges, 4, 1, f);
+    for (int i = 0; i < tok->n_merges; i++) {
+        fwrite(tok->merges[i].a, 1, 64, f);
+        fwrite(tok->merges[i].b, 1, 64, f);
+    }
+
+    /* weights */
+    fwrite(w->tok_emb->data, 4, w->tok_emb->size, f);
+    fwrite(w->output_norm->data, 4, w->output_norm->size, f);
+    fwrite(w->output->data, 4, w->output->size, f);
+    for (int l = 0; l < c->depth; l++) {
+        LayerWeights *lw = &w->layers[l];
+        fwrite(lw->attn_norm->data, 4, lw->attn_norm->size, f);
+        fwrite(lw->wq->data, 4, lw->wq->size, f);
+        fwrite(lw->wk->data, 4, lw->wk->size, f);
+        fwrite(lw->wv->data, 4, lw->wv->size, f);
+        fwrite(lw->wo->data, 4, lw->wo->size, f);
+        fwrite(lw->ffn_norm->data, 4, lw->ffn_norm->size, f);
+        fwrite(lw->w_gate->data, 4, lw->w_gate->size, f);
+        fwrite(lw->w_up->data, 4, lw->w_up->size, f);
+        fwrite(lw->w_down->data, 4, lw->w_down->size, f);
+    }
+
+    fclose(f);
+    struct stat st; stat(path, &st);
+    printf("[ckpt] saved %s (%.1f MB)\n", path, (float)st.st_size / 1048576);
+}
+
+static int load_checkpoint(const char *path, ModelWeights *w, Config *c, Tokenizer *tok) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[ckpt] cannot open %s\n", path); return -1; }
+
+    uint32_t magic;
+    fread(&magic, 4, 1, f);
+    if (magic != CKPT_MAGIC) { fprintf(stderr, "[ckpt] bad magic\n"); fclose(f); return -1; }
+
+    fread(&c->depth, 4, 1, f);
+    fread(&c->dim, 4, 1, f);
+    fread(&c->n_heads, 4, 1, f);
+    fread(&c->n_kv_heads, 4, 1, f);
+    fread(&c->head_dim, 4, 1, f);
+    fread(&c->hidden_dim, 4, 1, f);
+    fread(&c->vocab_size, 4, 1, f);
+    fread(&c->seq_len, 4, 1, f);
+    fread(&c->norm_eps, 4, 1, f);
+    fread(&c->rope_theta, 4, 1, f);
+
+    /* tokenizer */
+    tok_init(tok);
+    int vs; fread(&vs, 4, 1, f);
+    for (int i = 0; i < vs; i++) {
+        int len; fread(&len, 4, 1, f);
+        char buf[256] = {0};
+        if (len > 0 && len < 256) fread(buf, 1, len, f);
+        tok_add(tok, buf);
+    }
+    int nm; fread(&nm, 4, 1, f);
+    tok->merges = calloc(nm, sizeof(MergePair));
+    tok->n_merges = nm;
+    for (int i = 0; i < nm; i++) {
+        fread(tok->merges[i].a, 1, 64, f);
+        fread(tok->merges[i].b, 1, 64, f);
+    }
+
+    /* weights — init structure then load data */
+    init_weights(w, c);
+    fread(w->tok_emb->data, 4, w->tok_emb->size, f);
+    fread(w->output_norm->data, 4, w->output_norm->size, f);
+    fread(w->output->data, 4, w->output->size, f);
+    for (int l = 0; l < c->depth; l++) {
+        LayerWeights *lw = &w->layers[l];
+        fread(lw->attn_norm->data, 4, lw->attn_norm->size, f);
+        fread(lw->wq->data, 4, lw->wq->size, f);
+        fread(lw->wk->data, 4, lw->wk->size, f);
+        fread(lw->wv->data, 4, lw->wv->size, f);
+        fread(lw->wo->data, 4, lw->wo->size, f);
+        fread(lw->ffn_norm->data, 4, lw->ffn_norm->size, f);
+        fread(lw->w_gate->data, 4, lw->w_gate->size, f);
+        fread(lw->w_up->data, 4, lw->w_up->size, f);
+        fread(lw->w_down->data, 4, lw->w_down->size, f);
+    }
+
+    fclose(f);
+    printf("[ckpt] loaded %s — depth=%d dim=%d vocab=%d params=%.2fM\n",
+           path, c->depth, c->dim, c->vocab_size,
+           (float)count_params(c) / 1e6f);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * GGUF EXPORT — because llama.cpp won't run your raw floats.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
 static void write_u32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
 static void write_u64(FILE *f, uint64_t v) { fwrite(&v, 8, 1, f); }
 
@@ -2033,17 +2232,21 @@ static void chat_loop(ModelWeights *w, Config *c, Tokenizer *tok) {
 int main(int argc, char **argv) {
     setbuf(stdout, NULL); /* unbuffered output */
     int depth = 4; /* default */
+    char *chat_ckpt = NULL;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
             depth = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--chat") == 0 && i + 1 < argc) {
+            chat_ckpt = argv[++i];
         } else if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) {
             /* custom data path handled below */
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("l.c — one file. one llama. no excuses.\n\n");
             printf("Usage: ./l [options]\n");
             printf("  --depth N       Model depth (2=~1M, 4=~3M, 6=~7M, 8=~15M params)\n");
+            printf("  --chat FILE     Load checkpoint and chat (skip training)\n");
             printf("  --data PATH     Path to training text file\n");
             printf("  --url URL       HuggingFace rows API URL for training data\n");
             printf("  --parquet FILE  Extract text from local .parquet file\n");
@@ -2061,7 +2264,23 @@ int main(int argc, char **argv) {
     printf("  ║  one file. no frameworks. no excuses. ║\n");
     printf("  ╚══════════════════════════════════════╝\n\n");
 
+    /* ── Chat-only mode: load checkpoint, skip training ── */
+    if (chat_ckpt) {
+        Config c = {0};
+        c.norm_eps = 1e-5f;
+        c.rope_theta = 10000.0f;
+        Tokenizer tok;
+        ModelWeights w;
+        if (load_checkpoint(chat_ckpt, &w, &c, &tok) != 0) return 1;
+        chat_loop(&w, &c, &tok);
+        printf("[l] done.\n");
+        return 0;
+    }
+
     Config c = config_from_depth(depth);
+#ifdef USE_CUDA
+    if (gpu_init() != 0) { fprintf(stderr, "[error] CUDA init failed\n"); return 1; }
+#endif
 
     /* Parse overrides */
     for (int i = 1; i < argc; i++) {
@@ -2099,7 +2318,9 @@ int main(int argc, char **argv) {
     /* ── Step 2: Train BPE tokenizer ── */
     Tokenizer tok;
     tok_init(&tok);
-    tok_train_bpe(&tok, text, text_len, c.bpe_merges);
+    /* BPE on first 1MB — O(n²) per merge, full corpus is too slow */
+    int bpe_len = text_len < 1000000 ? text_len : 1000000;
+    tok_train_bpe(&tok, text, bpe_len, c.bpe_merges);
     c.vocab_size = tok.vocab_size;
 
     /* Tokenize training data */
@@ -2119,6 +2340,19 @@ int main(int argc, char **argv) {
     ModelWeights w;
     init_weights(&w, &c);
 
+#ifdef USE_CUDA
+    /* Upload ALL weights to GPU — resident, no per-matmul transfers */
+    {
+        ParamList tmp = collect_params(&w);
+        gpu_upload_weights(tmp.tensors, tmp.count);
+        int total_gpu = 0;
+        for (int i = 0; i < tmp.count; i++) total_gpu += tmp.tensors[i]->size;
+        printf("[cuda] uploaded %d weight tensors to GPU (%.1f MB resident)\n",
+               tmp.count, total_gpu * 4.0f / 1048576.0f);
+        fflush(stdout);
+    }
+#endif
+
     ParamList params = collect_params(&w);
 
     /* Allocate gradient buffers */
@@ -2133,6 +2367,22 @@ int main(int argc, char **argv) {
 
     printf("[train] starting training: %d steps, batch=%d, seq=%d, lr=%.1e\n",
            c.max_steps, c.batch_size, c.seq_len, c.lr);
+    fflush(stdout);
+
+#ifdef USE_CUDA
+    /* Pre-allocate GPU buffers for largest matmul: output head T×V×D */
+    {
+        int T = c.seq_len, V = c.vocab_size, D = c.dim, H = c.hidden_dim;
+        int biggest = T * V; /* T×V is largest for output head */
+        if (T * H > biggest) biggest = T * H;
+        if (V * D > biggest) biggest = V * D;
+        if (H * D > biggest) biggest = H * D;
+        gpu_ensure_tmp(biggest);
+        printf("[cuda] pre-allocated GPU buffers: %d floats (%.1f MB each)\n",
+               biggest, biggest * 4.0f / 1048576.0f);
+        fflush(stdout);
+    }
+#endif
 
     clock_t train_start = clock();
     float running_loss = 0.0f;
@@ -2186,6 +2436,10 @@ int main(int argc, char **argv) {
 
         /* Adam step */
         adam_step(opt, &params, grads, lr, c.weight_decay);
+#ifdef USE_CUDA
+        /* Resync updated weights to GPU after Adam modifies them */
+        gpu_resync_weights(params.tensors, params.count);
+#endif
 
         /* Logging */
         if ((step + 1) % c.log_every == 0 || step == 0) {
@@ -2194,6 +2448,7 @@ int main(int argc, char **argv) {
             float tok_per_sec = (float)((step + 1) * c.seq_len) / elapsed;
             printf("  step %4d/%d  loss=%.4f  lr=%.2e  tok/s=%.0f  (%.1fs)\n",
                    step + 1, c.max_steps, avg_loss, lr, tok_per_sec, elapsed);
+            fflush(stdout);
             running_loss = 0;
             loss_count = 0;
         }
@@ -2228,7 +2483,8 @@ int main(int argc, char **argv) {
         printf("[personality] no %s found, skipping finetune\n", c.personality_path);
     }
 
-    /* ── Step 6: Export GGUF ── */
+    /* ── Step 6: Save checkpoint + Export GGUF ── */
+    save_checkpoint("l.bin", &w, &c, &tok);
     export_gguf(&w, &c, &tok);
 
     /* ── Step 7: Chat ── */
