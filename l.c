@@ -161,16 +161,18 @@ static Config config_from_depth(int depth) {
     c.log_every = depth > 4 ? 100 : 20;
     c.eval_every = 100;
 
-    /* steps scale with depth: small models train fast, big ones need time.
-     * nanoGPT: 10M params, 5000 steps, batch 64. we scale proportionally. */
-    c.max_steps = depth * depth * 300;
-    if (c.max_steps < 500) c.max_steps = 500;
-    if (c.max_steps > 50000) c.max_steps = 50000;
+    /* steps ≈ params/1000. 25M params → 25000+ steps minimum.
+     * tiny stories and nanoGPT both use this ratio. less = garbage output.
+     * estimate params without vocab: ~12*depth*dim^2 for transformer layers */
+    { long pe = 12L * depth * c.dim * c.dim;
+      c.max_steps = (int)(pe / 1000);
+      if (c.max_steps < 2000) c.max_steps = 2000;
+      if (c.max_steps > 100000) c.max_steps = 100000; }
 
     /* BPE: more merges for bigger vocab with bigger models */
     c.bpe_merges = 2000;
 
-    c.personality_steps = 100;
+    c.personality_steps = 1000;
 
     snprintf(c.data_url, sizeof(c.data_url), "fineweb-edu"); /* marker: triggers HF API download */
     snprintf(c.data_path, sizeof(c.data_path), "l_data.txt");
