@@ -170,7 +170,7 @@ static Config config_from_depth(int depth) {
       if (c.max_steps > 100000) c.max_steps = 100000; }
 
     /* BPE: more merges for bigger vocab with bigger models */
-    c.bpe_merges = 2000;
+    c.bpe_merges = 4000;
 
     c.personality_steps = 1000;
 
@@ -2362,7 +2362,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < params.count; i++)
         grads[i] = calloc(params.tensors[i]->size, sizeof(float));
 
-    Adam *opt = adam_new(&params, 0.9f, 0.999f, 1e-8f);
+    Adam *opt = adam_new(&params, 0.9f, 0.95f, 1e-8f);
 
     /* ── Step 4: Train ── */
     TrainState ts = alloc_train_state(&c);
@@ -2401,26 +2401,33 @@ int main(int argc, char **argv) {
         }
         if (lr < c.lr * 0.01f) lr = c.lr * 0.01f;
 
-        /* Sample random sequence from training data */
-        int max_start = n_tokens - c.seq_len - 1;
-        if (max_start < 0) max_start = 0;
-        int start = (int)(rand_uniform() * max_start);
-
-        int *tokens = all_tokens + start;
-        int *targets = all_tokens + start + 1;
-
-        /* Forward */
-        float loss = train_forward(&w, &c, &ts, tokens, targets, c.seq_len);
-
-        running_loss += loss;
-        loss_count++;
-
-        /* Zero grads */
+        /* Zero grads once, then accumulate over batch_size sequences */
         for (int i = 0; i < params.count; i++)
             memset(grads[i], 0, params.tensors[i]->size * sizeof(float));
 
-        /* Analytical backward pass through all layers */
-        train_backward(&w, &c, &ts, tokens, targets, c.seq_len, grads);
+        float batch_loss = 0.0f;
+        for (int b = 0; b < c.batch_size; b++) {
+            int max_start = n_tokens - c.seq_len - 1;
+            if (max_start < 0) max_start = 0;
+            int start = (int)(rand_uniform() * max_start);
+
+            int *tokens = all_tokens + start;
+            int *targets = all_tokens + start + 1;
+
+            /* Forward + backward — gradients accumulate across batch */
+            float loss = train_forward(&w, &c, &ts, tokens, targets, c.seq_len);
+            batch_loss += loss;
+            train_backward(&w, &c, &ts, tokens, targets, c.seq_len, grads);
+        }
+        batch_loss /= c.batch_size;
+        running_loss += batch_loss;
+        loss_count++;
+
+        /* Scale gradients by 1/batch_size (backward computes per-sequence grads) */
+        { float inv_bs = 1.0f / c.batch_size;
+          for (int i = 0; i < params.count; i++)
+              for (int j = 0; j < params.tensors[i]->size; j++)
+                  grads[i][j] *= inv_bs; }
 
         /* Gradient clipping (global norm) */
         float grad_norm = 0.0f;
@@ -2474,9 +2481,28 @@ int main(int argc, char **argv) {
                 int *toks = pers_tokens + start;
                 int *tgts = pers_tokens + start + 1;
                 float loss = train_forward(&w, &c, &ts, toks, tgts, c.seq_len);
+                for (int i = 0; i < params.count; i++)
+                    memset(grads[i], 0, params.tensors[i]->size * sizeof(float));
+                train_backward(&w, &c, &ts, toks, tgts, c.seq_len, grads);
+                float gn = 0;
+                for (int i = 0; i < params.count; i++)
+                    for (int j = 0; j < params.tensors[i]->size; j++)
+                        gn += grads[i][j] * grads[i][j];
+                gn = sqrtf(gn);
+                if (gn > 1.0f) {
+                    float s = 1.0f / gn;
+                    for (int i = 0; i < params.count; i++)
+                        for (int j = 0; j < params.tensors[i]->size; j++)
+                            grads[i][j] *= s;
+                }
+                adam_step(opt, &params, grads, c.lr * 0.1f, c.weight_decay);
+#ifdef USE_CUDA
+                gpu_resync_weights(params.tensors, params.count);
+#endif
                 if ((step + 1) % 20 == 0)
                     printf("  personality step %d/%d  loss=%.4f\n",
                            step + 1, c.personality_steps, loss);
+                fflush(stdout);
             }
             free(pers_tokens);
         }
