@@ -156,7 +156,7 @@ static Config config_from_depth(int depth) {
     /* Training hyperparams scale with model size */
     c.lr = 3e-4f;
     c.batch_size = 4;
-    c.warmup_steps = 100;
+    c.warmup_steps = 500;
     c.weight_decay = 0.01f;
     c.log_every = depth > 4 ? 100 : 20;
     c.eval_every = 100;
@@ -172,7 +172,7 @@ static Config config_from_depth(int depth) {
     /* BPE: more merges for bigger vocab with bigger models */
     c.bpe_merges = 4000;
 
-    c.personality_steps = 1000;
+    c.personality_steps = 150;
 
     snprintf(c.data_url, sizeof(c.data_url), "fineweb-edu"); /* marker: triggers HF API download */
     snprintf(c.data_path, sizeof(c.data_path), "l_data.txt");
@@ -1778,7 +1778,7 @@ static int load_parquet(const char *path, const char *out_path, const char *col_
 
 /* Download training text — HF rows API paginated, or synthetic fallback */
 #define HF_BATCH 100
-#define HF_PAGES 50
+#define HF_PAGES 200
 
 static int download_data(Config *c) {
     struct stat st;
@@ -2476,14 +2476,24 @@ int main(int argc, char **argv) {
             int n_pers_tokens;
             int *pers_tokens = tok_encode(&tok, pers_text, pers_len, &n_pers_tokens);
 
+            int pers_batch = c.batch_size; /* grad accumulation like main training */
             for (int step = 0; step < c.personality_steps && n_pers_tokens > c.seq_len + 1; step++) {
-                int start = (int)(rand_uniform() * (n_pers_tokens - c.seq_len - 1));
-                int *toks = pers_tokens + start;
-                int *tgts = pers_tokens + start + 1;
-                float loss = train_forward(&w, &c, &ts, toks, tgts, c.seq_len);
                 for (int i = 0; i < params.count; i++)
                     memset(grads[i], 0, params.tensors[i]->size * sizeof(float));
-                train_backward(&w, &c, &ts, toks, tgts, c.seq_len, grads);
+                float batch_loss = 0;
+                for (int b = 0; b < pers_batch; b++) {
+                    int start = (int)(rand_uniform() * (n_pers_tokens - c.seq_len - 1));
+                    int *toks = pers_tokens + start;
+                    int *tgts = pers_tokens + start + 1;
+                    float loss = train_forward(&w, &c, &ts, toks, tgts, c.seq_len);
+                    batch_loss += loss;
+                    train_backward(&w, &c, &ts, toks, tgts, c.seq_len, grads);
+                }
+                batch_loss /= pers_batch;
+                { float inv = 1.0f / pers_batch;
+                  for (int i = 0; i < params.count; i++)
+                      for (int j = 0; j < params.tensors[i]->size; j++)
+                          grads[i][j] *= inv; }
                 float gn = 0;
                 for (int i = 0; i < params.count; i++)
                     for (int j = 0; j < params.tensors[i]->size; j++)
@@ -2495,13 +2505,13 @@ int main(int argc, char **argv) {
                         for (int j = 0; j < params.tensors[i]->size; j++)
                             grads[i][j] *= s;
                 }
-                adam_step(opt, &params, grads, c.lr * 0.1f, c.weight_decay);
+                adam_step(opt, &params, grads, c.lr * 0.01f, 0.1f);
 #ifdef USE_CUDA
                 gpu_resync_weights(params.tensors, params.count);
 #endif
                 if ((step + 1) % 20 == 0)
                     printf("  personality step %d/%d  loss=%.4f\n",
-                           step + 1, c.personality_steps, loss);
+                           step + 1, c.personality_steps, batch_loss);
                 fflush(stdout);
             }
             free(pers_tokens);
