@@ -291,6 +291,7 @@ typedef struct {
     int vocab_size;
     StoiTable stoi;
     int bos_id, eos_id;
+    int user_id, asst_id, end_id; /* SFT special tokens */
     MergePair *merges;
     int n_merges;
 } Tokenizer;
@@ -355,6 +356,19 @@ static void tok_init(Tokenizer *tok) {
     tok->tokens[tok->vocab_size] = strdup("<EOS>");
     stoi_put(&tok->stoi, "<EOS>", tok->vocab_size);
     tok->eos_id = tok->vocab_size++;
+
+    /* SFT special tokens */
+    tok->tokens[tok->vocab_size] = strdup("<user>");
+    stoi_put(&tok->stoi, "<user>", tok->vocab_size);
+    tok->user_id = tok->vocab_size++;
+
+    tok->tokens[tok->vocab_size] = strdup("<assistant>");
+    stoi_put(&tok->stoi, "<assistant>", tok->vocab_size);
+    tok->asst_id = tok->vocab_size++;
+
+    tok->tokens[tok->vocab_size] = strdup("<end>");
+    stoi_put(&tok->stoi, "<end>", tok->vocab_size);
+    tok->end_id = tok->vocab_size++;
 }
 
 static void tok_add(Tokenizer *tok, const char *s) {
@@ -2217,9 +2231,11 @@ static void chat_loop(ModelWeights *w, Config *c, Tokenizer *tok) {
         memset(rs.key_cache, 0, cache_bytes);
         memset(rs.value_cache, 0, cache_bytes);
 
-        /* Encode input */
+        /* Encode input with SFT chat template */
+        char wrapped[2048];
+        snprintf(wrapped, sizeof(wrapped), "<user>%s<end><assistant>", input);
         int n_input_ids;
-        int *input_ids = tok_encode(tok, input, len, &n_input_ids);
+        int *input_ids = tok_encode(tok, wrapped, strlen(wrapped), &n_input_ids);
 
         /* Feed input tokens (prefill) */
         int pos = 0;
@@ -2237,7 +2253,7 @@ static void chat_loop(ModelWeights *w, Config *c, Tokenizer *tok) {
             float *logits = forward_token(w, c, &rs, prev_token, pos);
             int next = sample_token(logits, c->vocab_size, 0.8f, 40);
 
-            if (next == tok->eos_id) break;
+            if (next == tok->eos_id || next == tok->end_id) break;
 
             /* Decode and print token */
             int dec_len;
@@ -2503,16 +2519,94 @@ int main(int argc, char **argv) {
     printf("[train] finished in %.1f seconds\n", total_time);
 
     /* ── Step 5: Personality finetune ── */
+    /* Try SFT format first (personality_sft.txt), fall back to plain text */
+    char sft_path[256];
+    snprintf(sft_path, 256, "personality_sft.txt");
     struct stat st;
-    if (stat(c.personality_path, &st) == 0) {
-        printf("[personality] found %s, finetuning...\n", c.personality_path);
+    int did_sft = 0;
+
+    if (stat(sft_path, &st) == 0 && st.st_size > 10) {
+        printf("[sft] found %s, finetuning with loss masking...\n", sft_path);
+        int sft_len;
+        char *sft_text = load_text(sft_path, &sft_len);
+        if (sft_text && sft_len > 10) {
+            int n_sft;
+            int *sft_tokens = tok_encode(&tok, sft_text, sft_len, &n_sft);
+            free(sft_text);
+
+            /* Build loss mask: 1 = compute loss (assistant), 0 = ignore (user/markers) */
+            int *sft_mask = calloc(n_sft, sizeof(int));
+            int in_assistant = 0;
+            for (int i = 0; i < n_sft; i++) {
+                if (sft_tokens[i] == tok.user_id) { in_assistant = 0; continue; }
+                if (sft_tokens[i] == tok.asst_id) { in_assistant = 1; continue; }
+                if (sft_tokens[i] == tok.end_id) { in_assistant = 0; continue; }
+                sft_mask[i] = in_assistant;
+            }
+
+            /* Count assistant tokens for logging */
+            int n_asst = 0;
+            for (int i = 0; i < n_sft; i++) n_asst += sft_mask[i];
+            printf("[sft] %d tokens total, %d assistant tokens (%.0f%%)\n",
+                   n_sft, n_asst, 100.0f * n_asst / n_sft);
+
+            int sft_batch = c.batch_size;
+            for (int step = 0; step < c.personality_steps && n_sft > c.seq_len + 1; step++) {
+                for (int i = 0; i < params.count; i++)
+                    memset(grads[i], 0, params.tensors[i]->size * sizeof(float));
+                float batch_loss = 0;
+                for (int b = 0; b < sft_batch; b++) {
+                    int start = (int)(rand_uniform() * (n_sft - c.seq_len - 1));
+                    int *toks = sft_tokens + start;
+                    /* Build masked targets: -1 for user tokens, next_token for assistant */
+                    int tgts[c.seq_len];
+                    for (int t = 0; t < c.seq_len; t++)
+                        tgts[t] = sft_mask[start + t + 1] ? sft_tokens[start + t + 1] : -1;
+                    float loss = train_forward(&w, &c, &ts, toks, tgts, c.seq_len);
+                    batch_loss += loss;
+                    train_backward(&w, &c, &ts, toks, tgts, c.seq_len, grads);
+                }
+                batch_loss /= sft_batch;
+                { float inv = 1.0f / sft_batch;
+                  for (int i = 0; i < params.count; i++)
+                      for (int j = 0; j < params.tensors[i]->size; j++)
+                          grads[i][j] *= inv; }
+                float gn = 0;
+                for (int i = 0; i < params.count; i++)
+                    for (int j = 0; j < params.tensors[i]->size; j++)
+                        gn += grads[i][j] * grads[i][j];
+                gn = sqrtf(gn);
+                if (gn > 1.0f) {
+                    float s = 1.0f / gn;
+                    for (int i = 0; i < params.count; i++)
+                        for (int j = 0; j < params.tensors[i]->size; j++)
+                            grads[i][j] *= s;
+                }
+                adam_step(opt, &params, grads, c.lr * 0.01f, 0.1f);
+#ifdef USE_CUDA
+                gpu_resync_weights(params.tensors, params.count);
+#endif
+                if ((step + 1) % 20 == 0)
+                    printf("  sft step %d/%d  loss=%.4f\n",
+                           step + 1, c.personality_steps, batch_loss);
+                fflush(stdout);
+            }
+            free(sft_tokens);
+            free(sft_mask);
+            did_sft = 1;
+        } else if (sft_text) free(sft_text);
+    }
+
+    /* Fall back to plain text personality if no SFT */
+    if (!did_sft && stat(c.personality_path, &st) == 0 && st.st_size > 10) {
+        printf("[personality] found %s, finetuning (plain text)...\n", c.personality_path);
         int pers_len;
         char *pers_text = load_text(c.personality_path, &pers_len);
         if (pers_text && pers_len > 10) {
             int n_pers_tokens;
             int *pers_tokens = tok_encode(&tok, pers_text, pers_len, &n_pers_tokens);
 
-            int pers_batch = c.batch_size; /* grad accumulation like main training */
+            int pers_batch = c.batch_size;
             for (int step = 0; step < c.personality_steps && n_pers_tokens > c.seq_len + 1; step++) {
                 for (int i = 0; i < params.count; i++)
                     memset(grads[i], 0, params.tensors[i]->size * sizeof(float));
@@ -2553,8 +2647,8 @@ int main(int argc, char **argv) {
             free(pers_tokens);
         }
         free(pers_text);
-    } else {
-        printf("[personality] no %s found, skipping finetune\n", c.personality_path);
+    } else if (!did_sft) {
+        printf("[personality] no %s or %s found, skipping finetune\n", sft_path, c.personality_path);
     }
 
     /* ── Step 6: Save checkpoint + Export GGUF ── */
