@@ -28,9 +28,10 @@ and is still waiting for `pip install torch` to finish.
 
 ## what
 
-one C file. 1909 lines. trains a full **Llama 3** from scratch.
+one C file. ~2900 lines. trains a full **Llama 3** from scratch.
 trains its own BPE tokenizer. writes analytical backward passes by hand.
 finetunes on any personality you throw at it. exports GGUF. chats with you.
+optional CUDA/cuBLAS — 436 tok/s on A100.
 
 no Python. no PyTorch. no pip. no conda. no venv. no docker.
 no requirements.txt. no "works on my machine." no excuses.
@@ -43,16 +44,27 @@ Karpathy made [nanochat](https://github.com/karpathy/nanochat) — same deal, Py
 
 somebody had to close the loop.
 
-**l.c trains a Llama 3 from scratch in one C file. zero dependencies. no GPU.**
+**l.c trains a Llama 3 from scratch in one C file. zero dependencies. GPU optional.**
 
 ## how
 
 ```
 cc l.c -O3 -lm -lpthread -o l
 
-./l --depth 2    # ~1.1M params — fast demo, 700 tok/s
+./l --depth 2    # ~1.1M params — fast demo, 700 tok/s CPU
 ./l --depth 4    # ~3M params   — your grandma's GPU isn't needed
-./l --depth 8    # ~15M params  — go make coffee
+./l --depth 8    # ~28M params  — go make coffee (or use CUDA below)
+```
+
+### with CUDA (optional)
+
+```bash
+# compile the CUDA backend first (ariannamethod_cuda.h required)
+nvcc -c ariannamethod_cuda.cu -o ariannamethod_cuda.o -O3
+cc l.c ariannamethod_cuda.o -O3 -lm -lpthread -DUSE_CUDA -lcublas -lcudart \
+   -L/usr/local/cuda/lib64 -o l_cuda
+
+./l_cuda --depth 8    # 436 tok/s on A100
 ```
 
 `--depth` is the only knob. everything else auto-scales.
@@ -60,12 +72,12 @@ that's more than most ML engineers can say about their hyperparameter searches.
 
 ## what happens when you run it
 
-1. downloads training data (or generates synthetic if you're impatient)
-2. trains a byte-level BPE tokenizer from scratch
+1. downloads training data from HuggingFace (FineWeb-Edu, paginated)
+2. trains a byte-level BPE tokenizer from scratch (cached in `l_bpe.cache`)
 3. builds a full Llama 3 transformer
 4. trains it with hand-written analytical backward passes
 5. finetunes on `personality.txt` (if you drop one in)
-6. exports `l.gguf` (llama.cpp compatible)
+6. exports `l.gguf` (llama.cpp / DOE compatible)
 7. drops you into interactive chat
 
 seven steps. one file. one binary.
@@ -115,6 +127,37 @@ echo "arr matey" > personality.txt  # pirate
 trains on data first. finetunes on personality after.
 same file. same binary. no separate scripts.
 
+## SFT (supervised fine-tuning)
+
+built-in chat SFT with loss masking. special tokens `<user>`, `<assistant>`, `<end>` are added to the vocabulary automatically.
+
+```bash
+# convert Q&A pairs to SFT format
+bash convert_sft.sh personality.txt > personality_sft.txt
+
+# train with SFT — loss computed only on assistant tokens
+./l --depth 8 --sft personality_sft.txt
+```
+
+loss masking means the model learns to *answer*, not to parrot your questions.
+
+## LoRA personality finetune
+
+full finetune kills coherence (catastrophic forgetting). LoRA freezes the base and trains only small adapters — 0.79% of parameters.
+
+```bash
+# standalone LoRA SFT — trains adapters, merges into base, saves
+./l --depth 8 --lora-sft personality_sft.txt
+
+# or load pre-trained LoRA adapters before chat
+./l --depth 8 --lora adapters.bin --chat
+```
+
+- rank=16 on wq/wk/wv/wo (all attention projections)
+- analytical backward through LoRA — same chain rule, no autograd
+- separate Adam optimizer for adapter params (lr=5e-4)
+- after training: merge into base weights for zero-overhead inference
+
 ## proof (actual output, depth 2, Mac CPU, 8GB RAM)
 
 ```
@@ -145,6 +188,9 @@ same file. same binary. no separate scripts.
 | arch | **Llama 3** | GPT-2 | GPT-2 | Llama 2 |
 | tokenizer | **from scratch** | tiktoken | tiktoken | pretrained |
 | backward | **analytical** | autograd | autograd | — |
+| SFT | **yes (loss masking)** | no | no | — |
+| LoRA | **yes (rank=16)** | no | no | — |
+| CUDA | **optional** | required | required | — |
 | deps | **0** | PyTorch, numpy... | PyTorch, numpy... | 0 |
 | files | **1** | ~10 | ~10 | 1 |
 | GGUF export | **yes** | no | no | — |
@@ -163,7 +209,7 @@ the bastard child nobody asked for. you're welcome.
 
 ## credits
 
-**Oleg** and **Claude**. one session. no GPU harmed.
+**Oleg** and **Claude**. many sessions. several GPUs harmed.
 
 inspired by [Karpathy](https://github.com/karpathy) — for showing transformers can be simple.
 we just removed the last dependency.
@@ -174,6 +220,6 @@ we just removed the last dependency.
 
 `cc l.c -O3 -lm -lpthread -o l && ./l --depth 4`
 
-*one file. one llama. no excuses.*
+*one file. one llama. zero dependencies.*
 
 </div>
